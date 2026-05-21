@@ -17,13 +17,26 @@ _config_path: Path | None = None
 _DEFAULT_STATE_DIR = Path.home() / ".hyperliquid-copy-trade"
 _CONFIG_NAME_RE = re.compile(r"^config_[0-9a-fA-F]{6}\.json$")
 _RESERVED_CONFIG_NAMES = {"config.json", "config_default.json"}
+_RUNTIME_STATE_KEYS = {
+    "desired_state",
+    "watchdog_enabled",
+    "maintenance_mode",
+    "maintenance_reason",
+    "restart_cooldown_secs",
+    "max_restarts_per_hour",
+    "restart_attempts",
+    "last_watchdog_check_at",
+    "last_restart_at",
+    "last_restart_error",
+}
 
 # ── 硬编码全局常量（不可配置） ────────────────────────────────────────────────
 TESTNET_BUILDER_ADDRESS = "0x58ee238a5ab9e90d063a7b43d498782664dc5716"
 MAINNET_BUILDER_ADDRESS = "0x7a4227ce12Cf0417FFcfcED77CA6A21cF399cEb0"
 # Backward-compatible alias for the dev/testnet default.
 BUILDER_ADDRESS = TESTNET_BUILDER_ADDRESS
-BUILDER_FEE_RATE = 5  # bps (basis points)
+# Hyperliquid SDK builder.f unit is tenths of a basis point: 50 = 5 bps = 0.05%.
+BUILDER_FEE_RATE = 50
 
 
 def get_state_dir() -> Path:
@@ -78,12 +91,21 @@ def get_config_path() -> Path:
 
 def load_config() -> dict:
     with open(get_config_path()) as f:
-        return json.load(f)
+        return _strip_runtime_state_keys(json.load(f))
+
+
+def _strip_runtime_state_keys(data: dict) -> dict:
+    """Runtime state belongs in service_state.json, never in config_<id>.json."""
+    if isinstance(data, dict):
+        for key in _RUNTIME_STATE_KEYS:
+            data.pop(key, None)
+    return data
 
 
 def save_config(cfg: dict) -> None:
     path = get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _strip_runtime_state_keys(dict(cfg))
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2)
     try:
@@ -123,6 +145,7 @@ def update_config(mutator) -> dict:
     with _ConfigLock(path):
         cfg = load_config()
         mutator(cfg)
+        _strip_runtime_state_keys(cfg)
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
         try:
             with os.fdopen(fd, "w") as f:
@@ -164,6 +187,11 @@ def get_moss_source_config(migrate_bot_id: bool = False) -> dict:
 def set_value(key: str, value) -> None:
     """设置配置项。支持 'a.b.c' 形式的嵌套路径写入；中间层不存在时自动创建为 dict。"""
     parts = key.split(".")
+    if parts[0] in _RUNTIME_STATE_KEYS:
+        raise SystemExit(
+            f"ERROR: {parts[0]} 是运行态字段，不允许写入配置文件；"
+            "请使用 `service watchdog ...` 命令管理自动重启状态。"
+        )
 
     def _mutate(cfg: dict) -> None:
         node = cfg

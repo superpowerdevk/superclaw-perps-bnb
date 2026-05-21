@@ -22,6 +22,15 @@ _SOURCE_MAP = {
 _DONE_REPORT_STATUSES = {"accepted", "duplicate", "done", "ok"}
 
 
+def _request_trade_report_flush(loop: asyncio.AbstractEventLoop, wake_event: asyncio.Event) -> None:
+    """Wake the batch reporter immediately after a new trade is enqueued."""
+    try:
+        loop.call_soon_threadsafe(wake_event.set)
+    except RuntimeError:
+        # Event loop already closed during shutdown.
+        pass
+
+
 def _utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -89,6 +98,41 @@ def _build_session_id(
     seed = f"{network}|{agent_id}|{follower_key}|{skill_instance_id}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"copy_{digest}"
+
+
+def _build_reporting_client() -> tuple[MossClient, str]:
+    """Build a reporting client and stable session id from current config."""
+    moss_cfg = cfg.get_moss_source_config()
+    base_url = moss_cfg.get("base_url", "")
+    agent_id = moss_cfg.get("agent_id", "")
+    private_key = cfg.get("private_key", "")
+    wallet_address = cfg.get("wallet_address", "")
+    main_address = cfg.get("main_address", "")
+    builder_address = cfg.get_builder_address()
+
+    if not all([base_url, agent_id, private_key]):
+        raise ValueError("Moss reporter config incomplete (need base_url, agent_id, private_key)")
+
+    client = MossClient(
+        base_url=base_url,
+        agent_id=agent_id,
+        private_key=private_key,
+        wallet_address=wallet_address,
+        builder_address=builder_address,
+        main_address=main_address,
+    )
+    if not client.has_follower_auth():
+        raise ValueError("Moss reporter requires private_key for follower auth")
+
+    skill_instance_id = cfg.get_or_create_skill_instance_id()
+    session_id = _build_session_id(
+        agent_id,
+        wallet_address,
+        cfg.get_network(),
+        skill_instance_id,
+        _normalize_address(main_address),
+    )
+    return client, session_id
 
 
 def _build_trade_item(row: dict) -> dict:
@@ -233,6 +277,27 @@ def _report_pending_trades(client: MossClient, session_id: str, batch_size: int)
     )
 
 
+def flush_trade_reports_once(batch_size: int | None = None) -> int:
+    """Synchronously flush pending trade reports once, used by CLI flows like pause."""
+    moss_cfg = cfg.get_moss_source_config()
+    if not moss_cfg.get("enabled"):
+        return 0
+
+    batch_size = batch_size if batch_size is not None else int(cfg.get("moss_report_batch_size", 100))
+    batch_size = min(max(batch_size, 1), 200)
+    pending_count = len(db.get_pending_trade_reports(limit=batch_size))
+    if pending_count <= 0:
+        return 0
+
+    client, session_id = _build_reporting_client()
+    try:
+        client.register_follower()
+    except Exception as exc:
+        logger.warning("Moss reporter register_follower failed during flush: %s", exc)
+    _report_pending_trades(client, session_id, batch_size)
+    return pending_count
+
+
 async def _heartbeat_loop(stop_event: asyncio.Event, client: MossClient, session_id: str) -> None:
     interval = int(cfg.get("moss_report_heartbeat_secs", 1800))
     interval = max(interval, 10)
@@ -250,23 +315,33 @@ async def _heartbeat_loop(stop_event: asyncio.Event, client: MossClient, session
             await asyncio.sleep(1)
 
 
-async def _trade_report_loop(stop_event: asyncio.Event, client: MossClient, session_id: str) -> None:
+async def _trade_report_loop(
+    stop_event: asyncio.Event,
+    client: MossClient,
+    session_id: str,
+    wake_event: asyncio.Event,
+) -> None:
     interval = int(cfg.get("moss_report_batch_secs", 30))
     interval = max(interval, 5)
     batch_size = int(cfg.get("moss_report_batch_size", 100))
     batch_size = min(max(batch_size, 1), 200)
     loop = asyncio.get_event_loop()
     while not stop_event.is_set():
+        wake_event.clear()
         try:
             await loop.run_in_executor(None, _report_pending_trades, client, session_id, batch_size)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Moss reporter trade batch failed: %s", exc)
-        for _ in range(interval):
-            if stop_event.is_set():
-                break
-            await asyncio.sleep(1)
+        if stop_event.is_set():
+            break
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=interval)
+            if not stop_event.is_set():
+                logger.info("Moss reporter immediate flush triggered by new trade")
+        except asyncio.TimeoutError:
+            pass
 
 
 async def run_moss_reporter(stop_event: asyncio.Event) -> None:
@@ -275,55 +350,32 @@ async def run_moss_reporter(stop_event: asyncio.Event) -> None:
     if not moss_cfg.get("enabled"):
         logger.info("Moss source not enabled, reporter not started")
         return
-
-    base_url = moss_cfg.get("base_url", "")
-    agent_id = moss_cfg.get("agent_id", "")
-    private_key = cfg.get("private_key", "")
-    wallet_address = cfg.get("wallet_address", "")
-    main_address = cfg.get("main_address", "")
-    builder_address = cfg.get_builder_address()
-
-    if not all([base_url, agent_id, private_key]):
-        logger.error("Moss reporter config incomplete (need base_url, agent_id, private_key)")
-        return
-
-    client = MossClient(
-        base_url=base_url,
-        agent_id=agent_id,
-        private_key=private_key,
-        wallet_address=wallet_address,
-        builder_address=builder_address,
-        main_address=main_address,
-    )
-
-    if not client.has_follower_auth():
-        logger.error("Moss reporter requires private_key for follower auth")
+    try:
+        client, session_id = _build_reporting_client()
+    except Exception as exc:
+        logger.error("%s", exc)
         return
 
     loop = asyncio.get_event_loop()
+    wake_event = asyncio.Event()
+    listener = lambda: _request_trade_report_flush(loop, wake_event)
+    db.register_trade_report_listener(listener)
     try:
         await loop.run_in_executor(None, client.register_follower)
     except Exception as exc:
         logger.warning("Moss reporter register_follower failed: %s", exc)
 
-    skill_instance_id = cfg.get_or_create_skill_instance_id()
-    session_id = _build_session_id(
-        agent_id,
-        wallet_address,
-        cfg.get_network(),
-        skill_instance_id,
-        _normalize_address(main_address),
-    )
     logger.info("Moss reporter started: session_id=%s", session_id)
 
     try:
         await asyncio.gather(
             _heartbeat_loop(stop_event, client, session_id),
-            _trade_report_loop(stop_event, client, session_id),
+            _trade_report_loop(stop_event, client, session_id, wake_event),
         )
     except asyncio.CancelledError:
         raise
     finally:
+        db.unregister_trade_report_listener(listener)
         try:
             await loop.run_in_executor(None, _send_heartbeat, client, session_id, "stopped")
         except Exception as exc:

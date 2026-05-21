@@ -16,12 +16,14 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import config as cfg
 
 _baseline_init_seen: set[str] = set()
 _baseline_init_seen_lock = threading.Lock()
+_trade_report_listeners: list[Callable[[], None]] = []
+_trade_report_listeners_lock = threading.Lock()
 
 
 def _db_path() -> str:
@@ -169,6 +171,31 @@ def init_db() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN agent_event_id TEXT")
         except sqlite3.OperationalError:
             pass  # 列已存在，忽略
+
+
+def register_trade_report_listener(listener: Callable[[], None]) -> None:
+    """注册 trade_report 入队监听器，用于唤醒即时上报。"""
+    with _trade_report_listeners_lock:
+        if listener not in _trade_report_listeners:
+            _trade_report_listeners.append(listener)
+
+
+def unregister_trade_report_listener(listener: Callable[[], None]) -> None:
+    with _trade_report_listeners_lock:
+        try:
+            _trade_report_listeners.remove(listener)
+        except ValueError:
+            pass
+
+
+def _notify_trade_report_listeners() -> None:
+    with _trade_report_listeners_lock:
+        listeners = list(_trade_report_listeners)
+    for listener in listeners:
+        try:
+            listener()
+        except Exception:
+            pass
 
 
 # ── Baseline ──────────────────────────────────────────────────────────────────
@@ -463,6 +490,7 @@ def record_trade(
 ) -> int:
     client_trade_id = client_trade_id or generate_client_trade_id()
     created_at = _utcnow_iso()
+    should_notify_reporter = False
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
@@ -492,7 +520,11 @@ def record_trade(
                    VALUES (?, ?, 'pending', 0, NULL, NULL, ?, ?)""",
                 (trade_id, client_trade_id, created_at, created_at),
             )
-        return trade_id
+            should_notify_reporter = True
+
+    if should_notify_reporter:
+        _notify_trade_report_listeners()
+    return trade_id
 
 
 def get_trade_by_id(trade_id: int) -> Optional[dict]:
