@@ -109,6 +109,26 @@ def cmd_start() -> None:
     cfg.ensure_dirs()
     db.init_db()
 
+    try:
+        from .agent_pointer import sync_agent_pointer
+        sync_agent_pointer()
+    except Exception as exc:
+        print(f"WARNING: agent pointer sync failed: {exc}")
+
+    if cfg.get("require_subaccount", False):
+        _sub = str(cfg.get("subaccount_address", "") or "").strip()
+        if not _sub:
+            try:
+                from .subaccount import ensure_subaccount
+                _sub = ensure_subaccount()
+            except Exception as exc:
+                print(f"WARNING: sub-account create failed: {exc}")
+                _sub = None
+            if not _sub:
+                from .subaccount import guidance_text
+                print(guidance_text())
+                sys.exit(1)
+
     raw_moss_cfg = cfg.get("moss_source", {})
     legacy_bot_id = (
         isinstance(raw_moss_cfg, dict)
